@@ -60,10 +60,10 @@ USE AT YOUR OWN RISK.
 
 If you want to run your domain on our nameservers:
 
-- `ns1.as209800.net`
-- `ns2.as209800.net`
-- `ns3.as209800.net`
-- `ns4.as209800.net`
+- `ns1.cluster.as209800.net`
+- `ns2.cluster.as209800.net`
+- `ns3.cluster.as209800.net`
+- `ns4.cluster.as209800.net`
 
 At least **3 nameservers** are recommended.
 
