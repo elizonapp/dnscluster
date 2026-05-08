@@ -1,0 +1,45 @@
+# =============================================================================
+# Caddyfile - reverse proxy with automatic Let's Encrypt
+# =============================================================================
+# Hostnames per node:
+#   grafana.<NODE_NAME>.<NODE_FQDN_DOMAIN>
+#   pdns-admin.<NODE_NAME>.<NODE_FQDN_DOMAIN>
+#
+# Variables are passed via {$VAR} syntax from the container environment.
+# =============================================================================
+
+{
+    email {$ACME_EMAIL}
+    # acme_ca via env var: production = empty (default LE prod),
+    # for testing: LE_ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory
+    acme_ca {$LE_ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+}
+
+grafana.{$NODE_NAME}.{$NODE_FQDN_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy grafana:3000
+    log {
+        output stdout
+        format console
+    }
+}
+
+pdns-admin.{$NODE_NAME}.{$NODE_FQDN_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy powerdns-admin:80
+    log {
+        output stdout
+        format console
+    }
+}
+
+# PowerDNS authoritative API/UI (webserver on :8081) via HTTPS on nsX.<domain>
+# Expected FQDN per node: <NODE_NAME>.<NODE_FQDN_DOMAIN> (e.g. ns1.cluster.example.net)
+{$NODE_NAME}.{$NODE_FQDN_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy powerdns:8081
+    log {
+        output stdout
+        format console
+    }
+}

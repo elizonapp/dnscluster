@@ -1,0 +1,377 @@
+# =============================================================================
+# DNS cluster stack (Docker Compose)
+# =============================================================================
+# WireGuard does NOT run in a container; it runs as a systemd host service.
+# Containers use an internal bridge network and expose services on the WireGuard
+# IP via host port bindings: "${NODE_WG_IP}:HOST:CONTAINER" (per node from .env).
+# wg0 must have that address, otherwise you'll get bind errors.
+# =============================================================================
+
+name: dnscluster
+
+networks:
+  cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  etcd_data:
+  pg_data:
+  prometheus_data:
+  grafana_data:
+  caddy_data:        # Let's Encrypt certificates (persistent!)
+  caddy_config:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # etcd - publiziert seine Ports auf der WG-IP, damit ns2/ns3 ihn erreichen
+  # ---------------------------------------------------------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: etcd
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "${NODE_WG_IP}:2379:2379"
+      - "${NODE_WG_IP}:2380:2380"
+    environment:
+      ETCD_NAME: ${NODE_NAME}
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      # Important: advertise an internal DNS URL in addition to the WG IP.
+      # Otherwise etcd clients (e.g. patronictl via the etcd v3 client) may try to
+      # connect to other members' WG IPs directly (from the member list) and time out.
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379,http://${NODE_WG_IP}:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_WG_IP}:2380
+      ETCD_INITIAL_CLUSTER: ${ETCD_INITIAL_CLUSTER}
+      ETCD_INITIAL_CLUSTER_STATE: ${ETCD_INITIAL_CLUSTER_STATE}
+      ETCD_INITIAL_CLUSTER_TOKEN: ${ETCD_INITIAL_CLUSTER_TOKEN}
+      ETCD_AUTO_COMPACTION_RETENTION: "1"
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_QUOTA_BACKEND_BYTES: "8589934592"
+      ETCD_HEARTBEAT_INTERVAL: "250"
+      ETCD_ELECTION_TIMEOUT: "2500"
+      ETCD_ENABLE_V2: "false"
+    volumes:
+      - etcd_data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Patroni + PostgreSQL
+  # ---------------------------------------------------------------------------
+  patroni:
+    build:
+      context: ./patroni
+    container_name: patroni
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "${NODE_WG_IP}:5432:5432"
+      - "${NODE_WG_IP}:8008:8008"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Patroni pg_hba: Quell-IP von HAProxy/PgBouncer → Postgres (Compose-Netz „cluster“)
+      CLUSTER_BRIDGE_SUBNET: ${CLUSTER_BRIDGE_SUBNET:-172.28.0.0/24}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Entrypoint (root): envsubst + Rechte auf pgdata; dann Patroni als postgres — siehe patroni/entrypoint.sh
+    command: ["patroni", "/var/lib/postgresql/patroni.yml"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./patroni/patroni.yml.tpl:/etc/patroni/patroni.yml.tpl:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8008/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # HAProxy
+  # ---------------------------------------------------------------------------
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: haproxy
+    restart: unless-stopped
+    networks:
+      - cluster
+    env_file: .env
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:7000:7000"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.tpl:ro
+      - ./scripts/render-haproxy.sh:/usr/local/bin/render-haproxy.sh:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        chmod +x /usr/local/bin/render-haproxy.sh
+        exec /usr/local/bin/render-haproxy.sh /usr/local/etc/haproxy/haproxy.cfg.tpl /tmp/haproxy.cfg
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      patroni:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:7000/ >/dev/null"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # PgBouncer
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    # bitnami/pgbouncer:<shorttag> is no longer available on Docker Hub; legacy repo for the same images.
+    image: bitnamilegacy/pgbouncer:1.22.1-debian-12-r9
+    container_name: pgbouncer
+    restart: unless-stopped
+    networks:
+      - cluster
+    environment:
+      PGBOUNCER_AUTH_TYPE: md5
+      PGBOUNCER_DATABASE: pdns
+      POSTGRESQL_USERNAME: pdns
+      POSTGRESQL_PASSWORD: ${PDNS_DB_PASSWORD}
+      POSTGRESQL_HOST: haproxy
+      POSTGRESQL_PORT: 5000
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/bitnami/pgbouncer/conf/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/bitnami/pgbouncer/conf/userlist.txt:ro
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    # pg_isready often requires valid auth with PgBouncer; Bash /dev/tcp is often missing (no bash).
+    # Bitnami legt wait-for-port in PATH (/opt/bitnami/common/bin).
+    healthcheck:
+      test: ["CMD", "wait-for-port", "--host=127.0.0.1", "--timeout=3", "--state=inuse", "6432"]
+      interval: 10s
+      timeout: 8s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # PowerDNS
+  # ---------------------------------------------------------------------------
+  powerdns:
+    image: powerdns/pdns-auth-49:4.9.4
+    container_name: powerdns
+    restart: unless-stopped
+    networks:
+      - cluster
+    user: "0:0"
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      PDNS_DB_PASSWORD: ${PDNS_DB_PASSWORD}
+      PDNS_API_KEY: ${PDNS_API_KEY}
+    volumes:
+      - ./powerdns/pdns.conf:/etc/powerdns/pdns.conf.tpl:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed -e "s/\$${PDNS_DB_PASSWORD}/${PDNS_DB_PASSWORD}/g" \
+            -e "s/\$${PDNS_API_KEY}/${PDNS_API_KEY}/g" \
+            /etc/powerdns/pdns.conf.tpl > /etc/powerdns/pdns.conf
+        exec pdns_server --daemon=no --guardian=no --loglevel=4
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pdns_control", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # PowerDNS-Admin
+  # ---------------------------------------------------------------------------
+  powerdns-admin:
+    image: powerdnsadmin/pda-legacy:v0.4.2
+    container_name: powerdns-admin
+    restart: unless-stopped
+    networks:
+      - cluster
+    # Kein externer Port - Zugriff nur via Caddy (HTTPS)
+    expose:
+      - "80"
+    environment:
+      SECRET_KEY: ${PDNS_ADMIN_SECRET_KEY}
+      SALT: ${PDNS_ADMIN_SALT}
+      PDNS_API_KEY: ${PDNS_API_KEY}
+      # PowerDNS-Admin legacy prefers SQLA_DB_*; this avoids it \"falling back to PgBouncer\".
+      # Connect directly to HAProxy:5000 (leader) — not PgBouncer (DB alias issues + pooling).
+      SQLA_DB_HOST: haproxy
+      SQLA_DB_PORT: "5000"
+      SQLA_DB_NAME: powerdnsadmin
+      SQLA_DB_USER: pdns
+      SQLA_DB_PASSWORD: ${PDNS_DB_PASSWORD}
+      # Also set (if the image evaluates SQLALCHEMY_DATABASE_URI directly):
+      SQLALCHEMY_DATABASE_URI: postgresql://pdns:${PDNS_DB_PASSWORD}@haproxy:5000/powerdnsadmin?sslmode=disable
+      GUNICORN_TIMEOUT: 60
+      GUNICORN_WORKERS: 4
+      GUNICORN_LOGLEVEL: INFO
+    depends_on:
+      haproxy:
+        condition: service_healthy
+      powerdns:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml.tpl:/etc/prometheus/prometheus.yml.tpl:ro
+      - ./scripts/render-prometheus.sh:/usr/local/bin/render-prometheus.sh:ro
+      - prometheus_data:/prometheus
+    user: root
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        chmod +x /usr/local/bin/render-prometheus.sh
+        exec /usr/local/bin/render-prometheus.sh /etc/prometheus/prometheus.yml.tpl /etc/prometheus/prometheus.yml /etc/prometheus/targets.json
+
+  # ---------------------------------------------------------------------------
+  # Exporter
+  # ---------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: node-exporter
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "${NODE_WG_IP}:9100:9100"
+    pid: host
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--web.listen-address=:9100'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "${NODE_WG_IP}:9187:9187"
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:${POSTGRES_SUPERUSER_PASSWORD}@patroni:5432/postgres?sslmode=disable"
+    depends_on:
+      patroni:
+        condition: service_healthy
+
+  pdns-exporter:
+    build:
+      context: ./docker/powerdns-exporter
+    image: dnscluster-pdns-exporter:local
+    container_name: pdns-exporter
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "${NODE_WG_IP}:9120:9120"
+    command:
+      # PDNS Auth 4.x: API unter /api/v1/ (ohne diese Basis liefert der janeczku-Exporter keine Metriken)
+      - "-api-url=http://powerdns:8081/api/v1/"
+      - "-api-key=${PDNS_API_KEY}"
+      - "-listen-address=:9120"
+    depends_on:
+      powerdns:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Grafana
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    restart: unless-stopped
+    networks:
+      - cluster
+    # Kein externer Port - Zugriff nur via Caddy (HTTPS)
+    expose:
+      - "3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      GF_SERVER_ROOT_URL: "https://grafana.${NODE_NAME}.${NODE_FQDN_DOMAIN}"
+      GF_SERVER_DOMAIN: "grafana.${NODE_NAME}.${NODE_FQDN_DOMAIN}"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+  # ---------------------------------------------------------------------------
+  # Caddy - HTTPS-Reverse-Proxy mit automatischem Let's Encrypt
+  # ---------------------------------------------------------------------------
+  # Reachable as:
+  #   https://grafana.<NODE_NAME>.<NODE_FQDN_DOMAIN>
+  #   https://pdns-admin.<NODE_NAME>.<NODE_FQDN_DOMAIN>
+  #
+  # ACME-Challenge: HTTP-01. Caddy muss daher Port 80 vom Internet erreichbar
+  # haben - das Zertifikat wird einmal beim ersten Start geholt und dann
+  # automatisch alle ~60 Tage erneuert (persistiert in caddy_data Volume).
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: caddy
+    restart: unless-stopped
+    networks:
+      - cluster
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL}
+      LE_ACME_CA: ${LE_ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
+      NODE_NAME: ${NODE_NAME}
+      NODE_FQDN_DOMAIN: ${NODE_FQDN_DOMAIN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - grafana
+      - powerdns-admin
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/", "--spider"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

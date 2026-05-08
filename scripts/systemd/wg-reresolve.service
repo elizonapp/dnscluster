@@ -1,0 +1,17 @@
+[Unit]
+Description=Re-resolve WireGuard peer endpoint FQDNs
+After=wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+# STACK_DIR vom Installer gesetzt
+EnvironmentFile=-/etc/default/dnscluster
+ExecStart=/usr/local/sbin/wg-reresolve.sh
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/var/log
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true

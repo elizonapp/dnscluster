@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-resolve WireGuard peer endpoints every 5 minutes
+After=wg-quick@wg0.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=wg-reresolve.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
