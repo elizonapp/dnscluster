@@ -60,10 +60,10 @@ USE AT YOUR OWN RISK.
 
 If you want to run your domain on our nameservers:
 
-- `ns1.as209800.net`
-- `ns2.as209800.net`
-- `ns3.as209800.net`
-- `ns4.as209800.net`
+- `ns1.cluster.as209800.net`
+- `ns2.cluster.as209800.net`
+- `ns3.cluster.as209800.net`
+- `ns4.cluster.as209800.net`
 
 At least **3 nameservers** are recommended.
 
@@ -99,9 +99,15 @@ Why not 2? The control plane (etcd/Patroni) is quorum-based: with 2 nodes you ca
 > `*.ns1.<your-cluster-domain>` CNAME `ns1.<your-cluster-domain>`
 > then the three mesh records are enough and all subdomains point there automatically.
 
+You need at least 2 vCores and 4GB DDR4 RAM per Node.
+4 vCores and 6GB DDR4 RAM are recommended.
+You will need at least 25GB of storage.
+
 ### Step 1 — bring the stack to the host, run the installer
 
 #### Option A (recommended): first-use installer (cluster-wide + per host)
+
+Upload and decompress the project.
 
 **1) Once (on any machine with the repo, without root):**
 
@@ -134,8 +140,9 @@ Optional flags (same semantics as `install.sh`):
 
 On each node:
 
+Upload and decompress the project.
+
 ```bash
-tar xzf dnscluster.tar.gz -C /tmp
 cd /tmp/dnscluster
 sudo ./scripts/install.sh --node ns1
 sudo ./scripts/install.sh --node ns2
@@ -169,6 +176,10 @@ restrict ssh-ed25519 AAAA... cluster-sync@nsX
 
 Note: this repo currently does **not** use a forced-command script; `cluster-sync.sh`
 executes remote commands directly via SSH (with the `sudo` whitelist created by `install.sh`).
+This is not recommended and untested.
+
+Please exchange the keys of each ns-cluster-sync user on each node.
+You will find the ns-cluster-sync user public key in the .ssh folder of the dockeruseragent user.
 
 ### Step 3 — distribute WireGuard public keys
 
