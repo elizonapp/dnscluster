@@ -357,7 +357,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "443:443/udp"   # HTTP/3
+      # UDP 443 is only needed for HTTP/3. Remove if your Docker host cannot bind UDP port 443.
+      # - "443:443/udp"   # HTTP/3
     environment:
       ACME_EMAIL: ${ACME_EMAIL}
       LE_ACME_CA: ${LE_ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
