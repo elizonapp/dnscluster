@@ -5,8 +5,9 @@ WORKDIR /src
 RUN git clone --depth 1 https://github.com/janeczku/powerdns_exporter.git .
 # Local copy replaces upstream main: CounterVec + .Set never compiled with current client_golang -> use GaugeVec for API counters.
 COPY go.mod powerdns_exporter.go ./
+# GOMAXPROCS=1 keeps go build within ~4GB RAM hosts (parallel compile is memory-heavy).
 RUN go mod tidy \
-    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /powerdns_exporter .
+    && CGO_ENABLED=0 GOMAXPROCS=1 go build -trimpath -ldflags="-s -w" -o /powerdns_exporter .
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates

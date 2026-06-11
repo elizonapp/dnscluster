@@ -128,10 +128,11 @@ services:
       patroni:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:7000/ >/dev/null"]
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 7000"]
       interval: 15s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
   # PgBouncer
@@ -242,6 +243,7 @@ services:
     restart: unless-stopped
     networks:
       - cluster
+    env_file: .env
     ports:
       - "127.0.0.1:9090:9090"
     extra_hosts:
