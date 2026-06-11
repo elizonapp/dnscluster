@@ -71,6 +71,7 @@ services:
   patroni:
     build:
       context: ./patroni
+    pull_policy: build
     container_name: patroni
     restart: unless-stopped
     networks:
@@ -120,8 +121,7 @@ services:
       - /bin/sh
       - -c
       - |
-        chmod +x /usr/local/bin/render-haproxy.sh
-        exec /usr/local/bin/render-haproxy.sh /usr/local/etc/haproxy/haproxy.cfg.tpl /tmp/haproxy.cfg
+        exec sh /usr/local/bin/render-haproxy.sh /usr/local/etc/haproxy/haproxy.cfg.tpl /tmp/haproxy.cfg
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -255,8 +255,7 @@ services:
       - /bin/sh
       - -c
       - |
-        chmod +x /usr/local/bin/render-prometheus.sh
-        exec /usr/local/bin/render-prometheus.sh /etc/prometheus/prometheus.yml.tpl /etc/prometheus/prometheus.yml /etc/prometheus/targets.json
+        exec sh /usr/local/bin/render-prometheus.sh /etc/prometheus/prometheus.yml.tpl /etc/prometheus/prometheus.yml /etc/prometheus/targets.json
 
   # ---------------------------------------------------------------------------
   # Exporter
@@ -299,6 +298,7 @@ services:
     build:
       context: ./docker/powerdns-exporter
     image: dnscluster-pdns-exporter:local
+    pull_policy: build
     container_name: pdns-exporter
     restart: unless-stopped
     networks:

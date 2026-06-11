@@ -16,6 +16,9 @@ This repository is **identical for all nodes**.
 WE DO NOT GIVE ANY SUPPORT ON CUSTOM SETUPS.  
 USE AT YOUR OWN RISK.
 
+**Platform:** only tested on **Debian 12**. Other distributions (including Debian 13
+or Ubuntu) may work but are unsupported.
+
 ## Architecture
 
 ```
@@ -136,6 +139,138 @@ Optional flags (same semantics as `install.sh`):
 - `--with-firewall`: configure UFW with the required ports
 - `--skip-docker`: skip Docker installation (if already installed)
 
+During `apply`, `install.sh` also configures **systemd-resolved** when
+`/etc/systemd/resolved.conf` exists and contains a `[Resolve]` section (see
+[systemd-resolved / DNS stub](#systemd-resolved--disable-local-dns-stub) below).
+
+#### `.env`: two locations — what `init` writes vs. what the host uses
+
+`first-use init` patches `.env` in the **repo directory where you run it**
+(e.g. `/tmp/dnscluster` or `~/dnscluster-1.0`). That file holds cluster-wide
+settings such as `CLUSTER_NODES`, `NODE_FQDN_DOMAIN`, WireGuard IPs, and secrets.
+
+`first-use apply` (via `install.sh`) provisions the host under
+`/home/dockeruseragent/dnscluster/`. **All runtime scripts use that path**, including:
+
+- `wireguard-render.sh` → `/etc/wireguard/wg0.conf`
+- `node-init.sh`, `docker compose`, `cluster-sync.sh`, …
+
+**Important:** on reinstall/update, `install.sh` copies the stack with `rsync` but
+**explicitly excludes** `.env` and `wireguard/keys/` so existing secrets and keys on
+the host are preserved. `apply` only reads the source `.env` to check that `--node` is
+listed in `CLUSTER_NODES` — it does **not** copy the init `.env` to the target.
+
+| Situation | Which `.env` is active on the host |
+|-----------|-------------------------------------|
+| First install, target dir did not exist yet (`cp -a`) | Source `.env` is copied along with the stack |
+| Reinstall / update, target dir already exists (`rsync --exclude .env`) | **Existing** `/home/dockeruseragent/dnscluster/.env` is kept |
+| Target had no `.env` | `.env.example` is copied as a fallback |
+
+So a successful `init` in your upload directory does **not** automatically fix a stale
+or wrong `.env` already sitting on the host. Typical symptom: `CLUSTER_NODES=ns1` on the
+host while the repo `.env` still has `ns1,ns2,ns3,ns4` — WireGuard then renders **no
+peers** (only the local node is listed), `wg show wg0` shows no `[Peer]` entries, and
+pings to other mesh IPs fail with `Required key not available`.
+
+**Verify on each node (compare both paths if you still have the upload tree):**
+
+```bash
+grep '^CLUSTER_NODES=' /home/dockeruseragent/dnscluster/.env
+# optional, if you ran init elsewhere:
+grep '^CLUSTER_NODES=' /path/to/your/upload/dnscluster/.env
+```
+
+Expected on every node (identical cluster-wide value):
+
+```bash
+CLUSTER_NODES=ns1,ns2,ns3,ns4
+```
+
+**Fix — copy cluster-wide settings to the live stack** (pick one):
+
+```bash
+# A) Full .env from init (passwords/secrets must already match across nodes)
+sudo cp /path/to/upload/dnscluster/.env /home/dockeruseragent/dnscluster/.env
+sudo chown dockeruseragent:dockeruseragent /home/dockeruseragent/dnscluster/.env
+
+# B) Patch only the node list
+sudo sed -i 's/^CLUSTER_NODES=.*/CLUSTER_NODES=ns1,ns2,ns3,ns4/' \
+  /home/dockeruseragent/dnscluster/.env
+```
+
+Then refresh node identity and WireGuard on that host:
+
+```bash
+cd /home/dockeruseragent/dnscluster
+sudo -iu dockeruseragent ./scripts/node-init.sh ns1   # or ns2, ns3, ns4
+sudo rm -f /etc/wireguard/wg0.conf                    # force re-render if peers were empty
+sudo ./scripts/wireguard-render.sh
+sudo systemctl restart wg-quick@wg0
+sudo wg show wg0
+```
+
+> **Tip:** run `init` once, then distribute the resulting `.env` to every node
+> (same secrets, same `CLUSTER_NODES`) **before** `apply`, or copy it to
+> `/home/dockeruseragent/dnscluster/.env` immediately after the first `apply` if the
+> target directory already existed from a previous attempt.
+
+#### systemd-resolved — disable local DNS stub
+
+WireGuard peer endpoints are **FQDNs** (`ns2.<domain>:51820`). `wg-quick` and
+`wg-reresolve.sh` resolve them via the host resolver. On Debian/Ubuntu with
+**systemd-resolved**, the default stub listener on `127.0.0.53` can return
+inconsistent or locally overridden answers (e.g. a node's own hostname from
+`/etc/hosts` as `127.0.1.1`, or different upstream results per host). That leads
+to wrong WireGuard endpoints and missing handshakes.
+
+`first-use apply` / `install.sh` therefore patches `/etc/systemd/resolved.conf`
+(idempotent) when the file exists and has a `[Resolve]` section:
+
+1. If `DNSStubListener=no` is already set → no change
+2. If `#DNSStubListener=…` or `DNSStubListener=…` exists → replace with
+   `DNSStubListener=no`
+3. Otherwise → append `DNSStubListener=no` at the end of the file
+4. Restart `systemd-resolved` when the unit is enabled
+
+**After this change**, ensure `/etc/resolv.conf` does **not** still point at the
+disabled stub. It should use the uplink file:
+
+```bash
+readlink -f /etc/resolv.conf
+# expected: /run/systemd/resolve/resolv.conf
+# not:      /run/systemd/resolve/stub-resolv.conf
+
+# if needed:
+sudo ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
+```
+
+**Verify mesh DNS is consistent on every node** (same public answer everywhere):
+
+```bash
+DOMAIN=example.net   # your NODE_FQDN_DOMAIN
+for n in ns1 ns2 ns3 ns4; do
+  printf "%s A:    " "$n"; dig +short "${n}.${DOMAIN}" A
+  printf "%s AAAA: " "$n"; dig +short "${n}.${DOMAIN}" AAAA
+done
+```
+
+If nodes disagree on a peer's IP, fix the **authoritative DNS zone** first, then:
+
+```bash
+sudo /usr/local/sbin/wg-reresolve.sh
+sudo wg show wg0
+```
+
+**Already deployed hosts** (without re-running the full installer):
+
+```bash
+sudo ./scripts/first-use.sh apply --node ns1
+# or: sudo ./scripts/install.sh --node ns1
+```
+
+Or manually edit `/etc/systemd/resolved.conf`, restart `systemd-resolved`, and fix
+`/etc/resolv.conf` as above.
+
 #### Option B (manual): run `install.sh` directly
 
 On each node:
@@ -150,11 +285,14 @@ sudo ./scripts/install.sh --node ns3 --with-firewall
 sudo ./scripts/install.sh --node ns4
 ```
 
-`install.sh` does the full host provisioning:
+`install.sh` does the full host provisioning (same `.env` behaviour as `apply` — see
+[`.env`: two locations](#env-two-locations--what-init-writes-vs-what-the-host-uses)):
 
 - packages + system-wide Docker
-- Service-User `dockeruseragent` (Stack liegt nachher in
+- Service user `dockeruseragent` (stack ends up in
 `/home/dockeruseragent/dnscluster/`)
+- `systemd-resolved`: `DNSStubListener=no` in `/etc/systemd/resolved.conf` when
+`[Resolve]` exists (see [systemd-resolved](#systemd-resolved--disable-local-dns-stub))
 - SSH sync user `ns-cluster-sync` (for inter-node operations)
 - runs `node-init.sh` → `.env` gets node-specific computed values
 - runs `wireguard-render.sh` → builds `/etc/wireguard/wg0.conf`
@@ -183,15 +321,20 @@ You will find the ns-cluster-sync user public key in the .ssh folder of the dock
 
 ### Step 3 — distribute WireGuard public keys
 
+Prerequisite: `CLUSTER_NODES` in `/home/dockeruseragent/dnscluster/.env` must list
+**all** mesh nodes (not only the local node name). See
+[`.env`: two locations](#env-two-locations--what-init-writes-vs-what-the-host-uses)
+if `wireguard-render.sh` produces an empty peer section.
+
 First time manually (SSH sync only works once everything is set up):
 
 On ns1:
 
 ```bash
 cat /home/dockeruseragent/dnscluster/wireguard/keys/publickey
-# -> diesen Wert auf ns2, ns3 und ns4 in
+# -> copy this value to ns2, ns3, and ns4 as
 #    /home/dockeruseragent/dnscluster/wireguard/keys/publickey.ns1
-#    speichern, dann dort:
+#    then on each of those nodes:
 sudo /home/dockeruseragent/dnscluster/scripts/wireguard-render.sh
 ```
 
@@ -201,8 +344,8 @@ Once all peer keys are present on all nodes:
 
 ```bash
 sudo systemctl restart wg-quick@wg0
-sudo wg show wg0          # alle Peers handshaken
-ping -c 2 10.100.0.2      # von ns1 nach ns2
+sudo wg show wg0          # all peers should show a recent handshake
+ping -c 2 10.100.0.2      # from ns1 to ns2
 ```
 
 **Tip (more convenient once SSH sync keys are authorized):**
@@ -320,7 +463,7 @@ docker compose stop patroni
 # verify on another node:
 curl -s http://10.100.0.2:8008/cluster | jq '.members[] | {name, role}'
 
-# Switchback nach NL:
+# Switch back to ns1 (example):
 curl -u patroni:<PATRONI_REST_PASSWORD> -X POST \
      -H "Content-Type: application/json" \
      -d '{"leader":"ns2","candidate":"ns1"}' \
@@ -329,6 +472,20 @@ curl -u patroni:<PATRONI_REST_PASSWORD> -X POST \
 
 ## Known pitfalls
 
+- **`.env` not propagated by `apply`:** `first-use init` updates the repo `.env`, but
+`install.sh` keeps an existing `/home/dockeruseragent/dnscluster/.env` on reinstall.
+Always check `CLUSTER_NODES` on the **host path** after `apply`, not only in your upload
+directory.
+- **`CLUSTER_NODES` too narrow:** if only the local node is listed (e.g. `CLUSTER_NODES=ns1`),
+`wireguard-render.sh` skips all remote peers. `apply --node ns1` still succeeds silently.
+Symptoms: empty `# >>> PEER_BLOCKS_BEGIN >>>` section in `/etc/wireguard/wg0.conf`, no peers in
+`wg show wg0`, ping errors `Required key not available`.
+- **systemd-resolved stub / inconsistent mesh DNS:** with the default `127.0.0.53` stub,
+`dig ns3.<domain>` can return different IPs on different nodes, or `127.0.1.1` for the local
+hostname. WireGuard then targets the wrong endpoint (`wg show wg0` → peer without
+`latest handshake`). `apply`/`install.sh` sets `DNSStubListener=no`; also check
+`/etc/resolv.conf` points to `/run/systemd/resolve/resolv.conf` and that authoritative
+DNS records for all `nsX.<domain>` names are correct and identical worldwide.
 - **etcd quorum:** if too many nodes are down, Patroni will refuse writes — by design.
 - **PgBouncer transaction pooling:** no prepared statements / sessions across transactions.
 For `psql`, connect directly via HAProxy on `127.0.0.1:5000`/`5001`.
@@ -362,7 +519,7 @@ Tip: a wildcard CNAME (see above) solves this in one go.
 ├── powerdns-admin/config.py
 ├── haproxy/haproxy.cfg
 ├── pgbouncer/pgbouncer.ini
-├── wireguard/wg0.conf.tpl         # gerendert nach /etc/wireguard/wg0.conf
+├── wireguard/wg0.conf.tpl         # rendered to /etc/wireguard/wg0.conf
 └── scripts/
     ├── install.sh                 # host installer (--node <node>)
     ├── node-init.sh               # updates .env with computed node values
@@ -406,14 +563,14 @@ CLUSTER_NODES=ns1,ns2,ns3,ns4,ns5
 NODE_NS5_WG_IP=10.100.0.5
 NODE_NS5_WG_AF=auto
 NODE_NS5_SITE=<label-optional>
-PATRONI_FAILOVER_PRIORITY_NS5=<zahl>
+PATRONI_FAILOVER_PRIORITY_NS5=<number>
 PATRONI_NOFAILOVER_NS5=false
 ```
 
 Then, on each existing node:
 
 ```bash
-./scripts/node-init.sh <dein-node>
+./scripts/node-init.sh <your-node>
 sudo ./scripts/wireguard-render.sh
 sudo /usr/local/sbin/wg-reresolve.sh
 ```
@@ -422,7 +579,7 @@ sudo /usr/local/sbin/wg-reresolve.sh
 
 - Create DNS for `ns5.<domain>` (A/AAAA) and optionally `grafana.ns5...`/`pdns-admin.ns5...`
 - Provision ns5 as usual:
-  - `./scripts/first-use.sh init` muss bereits gelaufen sein (oder `.env` ist bereits im Repo vorhanden)
+  - `./scripts/first-use.sh init` must have run already (or `.env` is already present in the repo)
   - `sudo ./scripts/first-use.sh apply --node ns5`
 - Then distribute WG public keys (as above, ideally via `cluster-sync.sh distribute-pubkey`).
 

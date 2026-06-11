@@ -12,13 +12,14 @@
 #   3) Service-User 'dockeruseragent' anlegen
 #   4) Stack nach /home/dockeruseragent/dnscluster verschieben
 #   5) sysctl
-#   6) WireGuard:
+#   6) systemd-resolved: DNSStubListener=no (consistent public DNS for WG FQDNs)
+#   7) WireGuard:
 #       - wg-reresolve.sh nach /usr/local/sbin/ kopieren
 #       - systemd-Timer wg-reresolve installieren
 #       - /etc/wireguard/wg0.conf via wireguard-render.sh erzeugen
 #       - wg-quick@wg0 enabled (wird aber erst aktiv, wenn Peer-Keys da sind)
-#   7) SSH-Sync-User 'ns-cluster-sync' anlegen mit forced-command
-#   8) ufw (optional)
+#   8) SSH-Sync-User 'ns-cluster-sync' anlegen mit forced-command
+#   9) ufw (optional)
 #
 # Usage:
 #   sudo ./scripts/install.sh --node ns1
@@ -180,6 +181,33 @@ vm.overcommit_ratio = 80
 vm.swappiness = 10
 EOF
 sysctl --system >/dev/null
+
+# ---------------------------------------------------------------------------
+# 6) systemd-resolved: disable local DNS stub (127.0.0.53)
+# ---------------------------------------------------------------------------
+RESOLVED_CONF=/etc/systemd/resolved.conf
+if [ -f "$RESOLVED_CONF" ] && grep -q '^\[Resolve\]' "$RESOLVED_CONF"; then
+    echo "==> Configuring $RESOLVED_CONF (DNSStubListener=no)"
+    if grep -qE '^DNSStubListener=no' "$RESOLVED_CONF"; then
+        echo "    DNSStubListener=no already set"
+    elif grep -qE '^#?DNSStubListener=' "$RESOLVED_CONF" \
+        || grep -qE '^# DNSStubListener=' "$RESOLVED_CONF"; then
+        sed -i -E \
+            -e 's/^#?DNSStubListener=.*/DNSStubListener=no/' \
+            -e 's/^# DNSStubListener=.*/DNSStubListener=no/' \
+            "$RESOLVED_CONF"
+        echo "    Replaced DNSStubListener=… with DNSStubListener=no"
+    else
+        printf '\nDNSStubListener=no\n' >> "$RESOLVED_CONF"
+        echo "    Appended DNSStubListener=no"
+    fi
+    if systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
+        systemctl restart systemd-resolved
+        echo "    Restarted systemd-resolved"
+    fi
+else
+    echo "==> Skipping $RESOLVED_CONF (missing or no [Resolve] section)"
+fi
 
 # ---------------------------------------------------------------------------
 # 7) WireGuard + Reresolve

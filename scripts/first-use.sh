@@ -14,7 +14,9 @@ Usage:
 
 Notes:
   - init creates/patches .env idempotently (cluster-wide identical; NODE_NAME stays per host).
-  - apply delegates to scripts/install.sh (host provisioning).
+  - apply delegates to scripts/install.sh (host provisioning), including:
+      /etc/systemd/resolved.conf → DNSStubListener=no (if [Resolve] exists)
+      so WireGuard FQDN lookups use public DNS instead of the 127.0.0.53 stub.
 EOF
 }
 
